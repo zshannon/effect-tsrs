@@ -8,6 +8,38 @@ The port provides a command-line diagnostic runner and Oxlint type-aware linting
 Effect quick fixes, refactors, and completions are available in the upstream
 [`@effect/tsgo` language service](https://github.com/Effect-TS/tsgo).
 
+## Native Rust embedding
+
+`check_file` runs the existing rules using a caller-owned TSRS checker and program:
+
+```rust,ignore
+let diagnostics = effect_tsrs::check_file(
+    &mut setup.checker,
+    &context,
+    file,
+    None, // optional JSON plugin options replacing tsconfig options
+    setup.program,
+    Some(&[effect_tsrs::Rule::FloatingEffect]),
+)?;
+```
+
+Finish ordinary type checking first. Keep the matching snapshot, program, source
+file and checker alive throughout the call. The returned diagnostics own their
+strings and locations and can outlive the snapshot. Preserve their severities;
+warnings are not compilation errors. Configuration inheritance reads through the
+program's filesystem and working directory, including virtual files.
+
+The call creates no program, checker or worker thread. Cancellation is checked
+before and after evaluation; rule traversal itself does not poll cancellation.
+The host owns concurrency, stack sizing and snapshot release. The embedding test
+covers real Effect diagnostics, directives, severity, corrections and repeated
+snapshot release; it does not establish production memory bounds.
+
+For a source dependency, prepare the compiler with `npm run setup` and use the
+same `.repos/tsrs` checkout for every TSRS crate in the host. This repository still
+requires the compiler extensions recorded in `patches/`; this API does not remove
+that prerequisite. `check_project` retains its CLI-oriented ownership model.
+
 ## Installation
 
 Add `@yielded/effect-tsrs` to your project:
