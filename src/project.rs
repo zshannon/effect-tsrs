@@ -332,47 +332,10 @@ fn check_program(
         result.summary.files_checked = files.len();
     }
     let analyses = analyze_files(program, &files, &file_configs);
-    for (mut file_config, found) in file_configs.into_iter().zip(analyses) {
-        for found in found {
-            let Some(severity) = file_config.severity(
-                found.rule,
-                found
-                    .range
-                    .source_pos()
-                    .expect("diagnostic source position"),
-            ) else {
-                continue;
-            };
-            result.diagnostics.push(Diagnostic {
-                location: location(found.file, found.range),
-                severity,
-                code: found.code,
-                name: found.rule.name(),
-                message: found.message,
-                related_information: found
-                    .related
-                    .into_iter()
-                    .map(|related| RelatedDiagnostic {
-                        location: location(related.file, related.range),
-                        code: related.code,
-                        message: related.message,
-                    })
-                    .collect(),
-            });
-        }
-        for diagnostic in file_config.finish() {
-            result.diagnostics.push(Diagnostic {
-                location: location(
-                    diagnostic.file.expect("directive source file"),
-                    diagnostic.range.expect("directive source range"),
-                ),
-                severity: diagnostic.severity,
-                code: diagnostic.code,
-                name: diagnostic.name,
-                message: diagnostic.message,
-                related_information: Vec::new(),
-            });
-        }
+    for (file_config, found) in file_configs.into_iter().zip(analyses) {
+        result
+            .diagnostics
+            .extend(collect_diagnostics(file_config, found));
     }
     result.timings.effect_ms = start.elapsed().as_secs_f64() * 1000.0;
     if options.type_check {
@@ -423,6 +386,104 @@ fn check_program(
     }
     result.timings.total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
     Ok(result)
+}
+
+/// Analyze one source file using the caller's existing program and checker.
+///
+/// The caller must keep the program's snapshot and checker handle alive for this
+/// call and supply a file and checker from that program. No program, checker,
+/// thread or arena is created here. The returned diagnostics own their data.
+/// Configuration inheritance uses the program's filesystem and working directory.
+/// `lspconfig` replaces plugin options; `rules` selects rules (`None` uses config,
+/// `Some(&[])` disables all). Severities and source directives are preserved.
+/// Cancellation is checked before and after analysis, not during rule traversal.
+/// The caller must finish ordinary type checking before calling this function.
+pub fn check_file(
+    checker: &mut tsrs_checker::Checker,
+    context: &Context,
+    file: P<SourceFile>,
+    lspconfig: Option<&str>,
+    program: &'static Program,
+    rules: Option<&[crate::Rule]>,
+) -> Result<Vec<Diagnostic>, String> {
+    if let Some(error) = context.err() {
+        return Err(error.to_string());
+    }
+    if file.is_declaration_file() || program.is_source_file_from_external_library(file) {
+        return Ok(Vec::new());
+    }
+    let host = effect_config::InheritanceHost {
+        cwd: program.get_current_directory().to_owned(),
+        fs: program.host().fs(),
+    };
+    let configuration =
+        effect_config::resolve_with_host(&program.command_line(), lspconfig, rules, &host)?;
+    let file_config = configuration.for_file(file);
+    let packages = PackageCache::new(program);
+    let version = detect_effect_version(program, &packages);
+    let found = rules::analyze_file(
+        checker,
+        program,
+        file,
+        &file_config.enabled,
+        &file_config.options,
+        &version,
+        &packages,
+    );
+    if let Some(error) = context.err() {
+        return Err(error.to_string());
+    }
+    let mut diagnostics = collect_diagnostics(file_config, found);
+    diagnostics.sort_by(|a, b| diagnostic_key(a).cmp(&diagnostic_key(b)));
+    Ok(diagnostics)
+}
+
+fn collect_diagnostics(
+    mut file_config: FileConfiguration,
+    found: Vec<RuleDiagnostic>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    for found in found {
+        let Some(severity) = file_config.severity(
+            found.rule,
+            found
+                .range
+                .source_pos()
+                .expect("diagnostic source position"),
+        ) else {
+            continue;
+        };
+        diagnostics.push(Diagnostic {
+            location: location(found.file, found.range),
+            severity,
+            code: found.code,
+            name: found.rule.name(),
+            message: found.message,
+            related_information: found
+                .related
+                .into_iter()
+                .map(|related| RelatedDiagnostic {
+                    location: location(related.file, related.range),
+                    code: related.code,
+                    message: related.message,
+                })
+                .collect(),
+        });
+    }
+    for diagnostic in file_config.finish() {
+        diagnostics.push(Diagnostic {
+            location: location(
+                diagnostic.file.expect("directive source file"),
+                diagnostic.range.expect("directive source range"),
+            ),
+            severity: diagnostic.severity,
+            code: diagnostic.code,
+            name: diagnostic.name,
+            message: diagnostic.message,
+            related_information: Vec::new(),
+        });
+    }
+    diagnostics
 }
 
 fn diagnostic_key(d: &Diagnostic) -> (&str, usize, usize, i32, &str, &str, &str) {

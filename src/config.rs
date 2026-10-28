@@ -91,7 +91,23 @@ pub(crate) fn resolve(
     lspconfig: Option<&str>,
     rules: Option<&[Rule]>,
 ) -> Result<Configuration, String> {
-    let original_plugin = configured_plugin(config);
+    let host = InheritanceHost {
+        cwd: std::env::current_dir()
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .into_owned(),
+        fs: osvfs::fs(),
+    };
+    resolve_with_host(config, lspconfig, rules, &host)
+}
+
+pub(crate) fn resolve_with_host(
+    config: &ParsedCommandLine,
+    lspconfig: Option<&str>,
+    rules: Option<&[Rule]>,
+    host: &dyn ParseConfigHost,
+) -> Result<Configuration, String> {
+    let original_plugin = configured_plugin_with_host(config, host);
     let diagnostics = unknown_rule_diagnostics(config, original_plugin.as_ref());
     let plugin = match lspconfig {
         Some(raw) => {
@@ -126,14 +142,11 @@ pub(crate) fn resolve(
         })
         .unwrap_or_default();
     let base_path = if config_path.is_empty() {
-        std::env::current_dir()
-            .map_err(|error| error.to_string())?
-            .to_string_lossy()
-            .into_owned()
+        host.get_current_directory().to_owned()
     } else {
         tspath::get_directory_path(&config_path)
     };
-    let case_sensitive = osvfs::fs().use_case_sensitive_file_names();
+    let case_sensitive = host.fs().use_case_sensitive_file_names();
     let overrides = plugin
         .get("overrides")
         .and_then(Value::as_array)
@@ -581,21 +594,33 @@ fn plugin_from_array(plugins: &Value) -> Option<Map<String, Value>> {
 }
 
 fn configured_plugin(config: &ParsedCommandLine) -> Option<Map<String, Value>> {
-    let raw = to_json(&config.raw);
-    // CompilerOptions.plugins stores names only. The compiler's JSONC parser
-    // recovers opaque plugin options, and its extension-cache callback exposes
-    // the exact ordered inheritance graph, including package resolution.
     let host = InheritanceHost {
         cwd: std::env::current_dir()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        fs: osvfs::fs(),
     };
+    configured_plugin_with_host(config, &host)
+}
+
+fn configured_plugin_with_host(
+    config: &ParsedCommandLine,
+    host: &dyn ParseConfigHost,
+) -> Option<Map<String, Value>> {
+    let raw = to_json(&config.raw);
+    // Recover opaque plugin options through the caller's filesystem, including
+    // the exact ordered inheritance graph and package resolution.
     let canonical = |path: &str| {
-        tspath::to_path(path, &host.cwd, host.fs().use_case_sensitive_file_names()).to_string()
+        tspath::to_path(
+            path,
+            host.get_current_directory(),
+            host.fs().use_case_sensitive_file_names(),
+        )
+        .to_string()
     };
     let mut inherited = HashMap::new();
     for path in config.extended_source_files() {
-        let Some(text) = osvfs::fs().read_file(&path) else {
+        let Some(text) = host.fs().read_file(&path) else {
             continue;
         };
         let (value, _) =
@@ -611,12 +636,12 @@ fn configured_plugin(config: &ParsedCommandLine) -> Option<Map<String, Value>> {
     }
     let root = tspath::to_path(
         &config_path,
-        &host.cwd,
+        host.get_current_directory(),
         host.fs().use_case_sensitive_file_names(),
     );
     inherited.insert(root.to_string(), raw);
     let graph = InheritanceGraph::default();
-    tsrs_tsoptions::parse_extended_config(&config_path, root.clone(), &[], &host, Some(&graph));
+    tsrs_tsoptions::parse_extended_config(&config_path, root.clone(), &[], host, Some(&graph));
     let merged = inherited_plugins(
         &root,
         &inherited,
@@ -626,13 +651,14 @@ fn configured_plugin(config: &ParsedCommandLine) -> Option<Map<String, Value>> {
     merged.and_then(|value| value.as_object().cloned())
 }
 
-struct InheritanceHost {
-    cwd: String,
+pub(crate) struct InheritanceHost<'a> {
+    pub cwd: String,
+    pub fs: &'a dyn FS,
 }
 
-impl ParseConfigHost for InheritanceHost {
+impl ParseConfigHost for InheritanceHost<'_> {
     fn fs(&self) -> &dyn FS {
-        osvfs::fs()
+        self.fs
     }
 
     fn get_current_directory(&self) -> &str {
@@ -1399,6 +1425,45 @@ mod tests {
     }
 
     #[test]
+    fn embedded_config_inheritance_uses_the_callers_filesystem() {
+        let fs = tsrs_vfs::vfstest::from_map(
+            [
+                (
+                    "/virtual/base/tsconfig.json",
+                    r#"{"files":[],"compilerOptions":{"plugins":[{"name":"@effect/language-service","diagnosticSeverity":{"floatingEffect":"off"},"overrides":[{"include":["src/**"],"options":{"diagnosticSeverity":{"asyncFunction":"warning"}}}]}]}}"#,
+                ),
+                (
+                    "/virtual/tsconfig.json",
+                    r#"{"extends":"./base/tsconfig.json","files":[],"compilerOptions":{"plugins":[{"name":"@effect/language-service","pipeableMinArgCount":5}]}}"#,
+                ),
+            ],
+            true,
+        );
+        let host = InheritanceHost {
+            cwd: "/virtual".into(),
+            fs: &fs,
+        };
+        let (parsed, _) = tsrs_tsoptions::get_parsed_command_line_of_config_file(
+            "/virtual/tsconfig.json",
+            None,
+            None,
+            &host,
+            None,
+        );
+        let parsed = parsed.unwrap();
+        let plugin = configured_plugin_with_host(&parsed, &host).unwrap();
+        assert_eq!(plugin["diagnosticSeverity"]["floatingEffect"], "off");
+        assert_eq!(plugin["pipeableMinArgCount"], 5);
+        assert_eq!(
+            plugin["overrides"][0]["include"],
+            json!(["/virtual/base/src/**"])
+        );
+        let config = resolve_with_host(&parsed, None, None, &host).unwrap();
+        assert!(config.has_plugin());
+        assert_eq!(config.options["pipeableMinArgCount"], 5);
+    }
+
+    #[test]
     fn native_config_parser_preserves_partial_plugin_inheritance_and_typo_locations() {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let directory = std::env::temp_dir().join(format!(
@@ -1414,6 +1479,7 @@ mod tests {
         std::fs::write(directory.join("tsconfig.json"), r#"{"extends":"./base/tsconfig.json","files":[],"compilerOptions":{"plugins":[{"name":"@effect/language-service","diagnosticSeverity":{"floatingEfect":"error"}}]}}"#).unwrap();
         let host = InheritanceHost {
             cwd: directory.to_string_lossy().into_owned(),
+            fs: osvfs::fs(),
         };
         let (parsed, _) = tsrs_tsoptions::get_parsed_command_line_of_config_file(
             "tsconfig.json",

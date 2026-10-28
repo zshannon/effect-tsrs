@@ -1,12 +1,14 @@
-//! A short-lived, single-project diagnostic runner over the native tsrs checker.
+//! Native Effect diagnostics over the tsrs checker.
 //!
 //! The compiler's default arenas live until process exit. This entry point is for
 //! CLI processes, not repeated project rebuilds in a language server.
+//! `check_file` instead borrows the caller's existing program and checker.
 
 mod config;
 mod overlay;
 pub mod oxlint;
 mod project;
+pub use project::check_file;
 mod project_resolver;
 mod rules;
 
